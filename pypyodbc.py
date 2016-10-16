@@ -25,7 +25,7 @@ pooling = True
 apilevel = '2.0'
 paramstyle = 'qmark'
 threadsafety = 1
-version = '1.3.0'
+version = '1.3.3'
 lowercase=True
 
 DEBUG = 0
@@ -89,7 +89,7 @@ SQL_ATTR_AUTOCOMMIT = SQL_AUTOCOMMIT = 102
 SQL_MODE_DEFAULT = SQL_MODE_READ_WRITE = 0; SQL_MODE_READ_ONLY = 1
 SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON = 0, 1
 SQL_IS_UINTEGER = -5
-SQL_ATTR_LOGIN_TIMEOUT = 103; SQL_ATTR_CONNECTION_TIMEOUT = 113
+SQL_ATTR_LOGIN_TIMEOUT = 103; SQL_ATTR_CONNECTION_TIMEOUT = 113;SQL_ATTR_QUERY_TIMEOUT = 0
 SQL_COMMIT, SQL_ROLLBACK = 0, 1
 
 SQL_INDEX_UNIQUE,SQL_INDEX_ALL = 0,1
@@ -433,7 +433,7 @@ else:
         if library is None:
             # If find_library still can not find the library
             # we try finding it manually from where libodbc.so usually appears
-            lib_paths = ("/usr/lib/libodbc.so","/usr/lib/i386-linux-gnu/libodbc.so","/usr/lib/x86_64-linux-gnu/libodbc.so","/usr/lib/libiodbc.dylib")
+            lib_paths = ("/app/.heroku/vendor/lib/libodbc.so","/usr/lib/libodbc.so","/usr/lib/i386-linux-gnu/libodbc.so","/usr/lib/x86_64-linux-gnu/libodbc.so","/usr/lib/libiodbc.dylib")
             lib_paths = [path for path in lib_paths if os.path.exists(path)]
             if len(lib_paths) == 0 :
                 raise OdbcNoLibrary('ODBC Library is not found. Is LD_LIBRARY_PATH set?')
@@ -475,7 +475,6 @@ create_buffer_u = ctypes.create_unicode_buffer
 create_buffer = ctypes.create_string_buffer
 wchar_pointer = ctypes.c_wchar_p
 UCS_buf = lambda s: s
-
 def UCS_dec(buffer):
     i = 0
     uchars = []
@@ -486,24 +485,6 @@ def UCS_dec(buffer):
         uchars.append(uchar)
         i += ucs_length
     return ''.join(uchars)
-
-def UTF16_BE_dec(buffer):
-    i = 0
-    uchars = []
-    while True:
-        # TODO: verify that this condition correctly identifies
-        # a surrogate pair in UTF-16 BE
-        if ord(buffer.raw[i+1]) & 0xd0 == 0xd0:
-            n = 2
-        else:
-            n = 1
-        uchar = buffer.raw[i:i + n * ucs_length].decode(odbc_decoding)
-        if uchar == unicode('\x00'):
-            break
-        uchars.append(uchar)
-        i += n * ucs_length
-    return ''.join(uchars)
-
 from_buffer_u = lambda buffer: buffer.value
 
 # This is the common case on Linux, which uses wide Python build together with
@@ -518,11 +499,7 @@ if sys.platform not in ('win32','cli'):
         def UCS_buf(s):
             return s.encode(odbc_encoding)
 
-        if odbc_encoding == 'utf_16':
-            from_buffer_u = UTF16_BE_dec
-        else:
-            from_buffer_u = UCS_dec
-
+        from_buffer_u = UCS_dec
 
     # Exoteric case, don't really care.
     elif UNICODE_SIZE < SQLWCHAR_SIZE:
@@ -588,19 +565,21 @@ def dttm_cvt(x):
     if py_v3:
         x = x.decode('ascii')
     if x == '': return None
-    else: return datetime.datetime(int(x[0:4]),int(x[5:7]),int(x[8:10]),int(x[10:13]),int(x[14:16]),int(x[17:19]),int(x[20:].ljust(6,'0')))
+    x = x.ljust(26,'0')
+    return datetime.datetime(int(x[0:4]),int(x[5:7]),int(x[8:10]),int(x[10:13]),int(x[14:16]),int(x[17:19]),int(x[20:26]))
 
 def tm_cvt(x):
     if py_v3:
         x = x.decode('ascii')
     if x == '': return None
-    else: return datetime.time(int(x[0:2]),int(x[3:5]),int(x[6:8]),int(x[9:].ljust(6,'0')))
+    x = x.ljust(15,'0')
+    return datetime.time(int(x[0:2]),int(x[3:5]),int(x[6:8]),int(x[9:15]))
 
 def dt_cvt(x):
     if py_v3:
         x = x.decode('ascii')
     if x == '': return None
-    else: return datetime.date(int(x[0:4]),int(x[5:7]),int(x[8:10]))
+    else:return datetime.date(int(x[0:4]),int(x[5:7]),int(x[8:10]))
 
 def Decimal_cvt(x):
     if py_v3:
@@ -719,6 +698,7 @@ funcs_with_ret = [
     "SQLStatisticsW",
     "SQLTables",
     "SQLTablesW",
+    "SQLSetStmtAttr"
 ]
 
 for func_name in funcs_with_ret:
@@ -953,7 +933,7 @@ def ctrl_err(ht, h, val_ret, ansi):
         else:
             raw_s = str_8b
     else:
-        state = create_buffer_u(24)
+        state = create_buffer_u(22)
         Message = create_buffer_u(1024*4)
         ODBC_func = ODBC_API.SQLGetDiagRecW
         raw_s = unicode
@@ -978,7 +958,7 @@ def ctrl_err(ht, h, val_ret, ansi):
                 raise IntegrityError(state,err_text)
             elif state == raw_s('0A000'):
                 raise NotSupportedError(state,err_text)
-            elif state in (raw_s('HYT00'),raw_s('HYT01'),raw_s('01000')):
+            elif state in (raw_s('HYT00'),raw_s('HYT01')):
                 raise OperationalError(state,err_text)
             elif state[:2] in (raw_s('IM'),raw_s('HY')):
                 raise Error(state,err_text)
@@ -1191,10 +1171,19 @@ class Cursor:
         self.arraysize = 1
         ret = ODBC_API.SQLAllocHandle(SQL_HANDLE_STMT, self.connection.dbc_h, ADDR(self.stmt_h))
         check_success(self, ret)
+    
+        self.timeout = conx.timeout
+        if self.timeout != 0:
+            self.set_timeout(self.timeout)
+        
         self._PARAM_SQL_TYPE_LIST = []
         self.closed = False      
 
-            
+    def set_timeout(self, timeout):
+        self.timeout = timeout
+        ret = ODBC_API.SQLSetStmtAttr(self.stmt_h, SQL_ATTR_QUERY_TIMEOUT, self.timeout, 0)
+        check_success(self, ret)
+        
     def prepare(self, query_string):
         """prepare a query"""
         
@@ -1778,7 +1767,7 @@ class Cursor:
                 if ret != SQL_SUCCESS:
                     check_success(self, ret)
             
-            col_name = from_buffer_u(Cname)
+            col_name = Cname.value
             if lowercase:
                 col_name = col_name.lower()
             #(name, type_code, display_size, 
@@ -1878,8 +1867,6 @@ class Cursor:
                                     value_list.append(buf_cvt_func(alloc_buffer.raw[:used_buf_len.value]))
                                 elif target_type == SQL_C_WCHAR:
                                     value_list.append(buf_cvt_func(from_buffer_u(alloc_buffer)))
-                                elif alloc_buffer.value == '':
-                                    value_list.append(None)
                                 else:
                                     value_list.append(buf_cvt_func(alloc_buffer.value))
                             else:
@@ -2393,11 +2380,15 @@ class Cursor:
     def __enter__(self):
         return self
 
+
+
+
+
     
 # This class implement a odbc connection. 
 #
 #
-
+connection_timeout = 0
 
 class Connection:
     def __init__(self, connectString = '', autocommit = False, ansi = False, timeout = 0, unicode_results = use_unicode, readonly = False, **kargs):
@@ -2409,6 +2400,7 @@ class Connection:
         self.dbc_h = ctypes.c_void_p()
         self.autocommit = autocommit
         self.readonly = False
+        # the query timeout value
         self.timeout = 0
         # self._cursors = []
         for key, value in list(kargs.items()):
@@ -2433,10 +2425,18 @@ class Connection:
         
         ret = ODBC_API.SQLAllocHandle(SQL_HANDLE_DBC, shared_env_h, ADDR(self.dbc_h))
         check_success(self, ret)
+
+        self.connection_timeout = connection_timeout
+        if self.connection_timeout != 0:
+            self.set_connection_timeout(connection_timeout)
+
         
         self.connect(connectString, autocommit, ansi, timeout, unicode_results, readonly)
         
-            
+    def set_connection_timeout(self,connection_timeout):
+        self.connection_timeout = connection_timeout
+        ret = ODBC_API.SQLSetConnectAttr(self.dbc_h, SQL_ATTR_CONNECTION_TIMEOUT, connection_timeout, SQL_IS_UINTEGER);
+        check_success(self, ret)
      
     def connect(self, connectString = '', autocommit = False, ansi = False, timeout = 0, unicode_results = use_unicode, readonly = False):
         """Connect to odbc, using connect strings and set the connection's attributes like autocommit and timeout
@@ -2446,11 +2446,8 @@ class Connection:
         # Before we establish the connection by the connection string
         # Set the connection's attribute of "timeout" (Actully LOGIN_TIMEOUT)
         if timeout != 0:
-            self.settimeout(timeout)
             ret = ODBC_API.SQLSetConnectAttr(self.dbc_h, SQL_ATTR_LOGIN_TIMEOUT, timeout, SQL_IS_UINTEGER);
             check_success(self, ret)
-
-
         # Create one connection with a connect string by calling SQLDriverConnect
         # and make self.dbc_h the handle of this connection
 
@@ -2499,9 +2496,9 @@ class Connection:
         # Set the connection's attribute of "readonly" 
         #
         self.readonly = readonly
-        
-        ret = ODBC_API.SQLSetConnectAttr(self.dbc_h, SQL_ATTR_ACCESS_MODE, self.readonly and SQL_MODE_READ_ONLY or SQL_MODE_READ_WRITE, SQL_IS_UINTEGER)
-        check_success(self, ret)
+        if self.readonly == True:
+            ret = ODBC_API.SQLSetConnectAttr(self.dbc_h, SQL_ATTR_ACCESS_MODE, SQL_MODE_READ_ONLY, SQL_IS_UINTEGER)
+            check_success(self, ret)
         
         self.unicode_results = unicode_results
         self.connected = 1
@@ -2516,10 +2513,6 @@ class Connection:
     def add_output_converter(self, sqltype, func):
         self.output_converter[sqltype] = func
     
-    def settimeout(self, timeout):
-        ret = ODBC_API.SQLSetConnectAttr(self.dbc_h, SQL_ATTR_CONNECTION_TIMEOUT, timeout, SQL_IS_UINTEGER);
-        check_success(self, ret)
-        self.timeout = timeout
         
 
     def ConnectByDSN(self, dsn, user, passwd = ''):
@@ -2548,8 +2541,6 @@ class Connection:
         return cur
 
     def update_db_special_info(self):
-        if 'OdbcFb' in self.getinfo(SQL_DRIVER_NAME):
-            return
         for sql_type in (
             SQL_TYPE_TIMESTAMP,
             SQL_TYPE_DATE,
@@ -2754,7 +2745,7 @@ def win_connect_mdb(mdb_path):
     
     
     
-def win_compact_mdb(mdb_path, compacted_mdb_path=None, sort_order = "General\0", password=None):
+def win_compact_mdb(mdb_path, compacted_mdb_path, sort_order = "General\0\0"):
     if sys.platform not in ('win32','cli'):
         raise Exception('This function is available for use in Windows only.')
     
@@ -2768,19 +2759,11 @@ def win_compact_mdb(mdb_path, compacted_mdb_path=None, sort_order = "General\0",
     #COMPACT_DB=<source path> <destination path> <sort order>
     ctypes.windll.ODBCCP32.SQLConfigDataSource.argtypes = [ctypes.c_void_p,ctypes.c_ushort,ctypes.c_char_p,ctypes.c_char_p]
     #driver_name = "Microsoft Access Driver (*.mdb)"
-    
-    if not compacted_mdb_path:
-        compacted_mdb_path = mdb_path
-    
-    pass_config = ""
-    if password:
-        pass_config = "PWD=" + password
-    
     if py_v3:
-        c_Path = bytes("COMPACT_DB=\"" + mdb_path + "\" \"" + compacted_mdb_path + "\" " + sort_order + pass_config,'mbcs')
+        c_Path = bytes("COMPACT_DB=" + mdb_path + " " + compacted_mdb_path + " " + sort_order,'mbcs')
         #driver_name = bytes(driver_name,'mbcs')
     else:
-        c_Path = "COMPACT_DB=\"" + mdb_path + "\" \"" + compacted_mdb_path + "\" " + sort_order + pass_config
+        c_Path = "COMPACT_DB=" + mdb_path + " " + compacted_mdb_path + " " + sort_order
 
     ODBC_ADD_SYS_DSN = 1
     ret = ctypes.windll.ODBCCP32.SQLConfigDataSource(None,ODBC_ADD_SYS_DSN,driver_name, c_Path)
